@@ -40,6 +40,12 @@ anyhow = "1"
 # Byte manipulation for FastCGI streams
 bytes = "1"
 
+# Unix process management - fork, setuid/setgid, waitpid, signals
+nix = { version = "0.29", features = ["user", "process", "signal", "fs"] }
+
+# Low-level libc FFI - dlmopen, dlsym, sigsetjmp for PHP instance isolation
+libc = "0.2"
+
 [features]
 default = []
 static = ["ext-php-rs/static"]

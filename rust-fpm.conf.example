@@ -2,10 +2,14 @@
 pid = "/var/run/rust-fpm.pid"
 error_log = "/var/log/rust-fpm/error.log"
 
+# Default pool — runs as www-data for security isolation
 [www]
 listen = "/var/run/php-fpm.sock"
+user = "www-data"
+group = "www-data"
 listen_owner = "www-data"
 listen_group = "www-data"
+listen_mode = "0660"
 
 pm = "dynamic"
 pm_max_children = 5
@@ -15,3 +19,15 @@ pm_max_spare_servers = 3
 
 request_terminate_timeout = "60s"
 php_ini = "/etc/php/8.3/fpm/php.ini"
+
+# Additional pool for a separate site — runs as a different user
+# Provides OS-level isolation: alice cannot read www-data's files
+# [alice]
+# listen = "/var/run/php-fpm-alice.sock"
+# user = "alice"
+# group = "alice"
+# listen_owner = "www-data"
+# listen_group = "www-data"
+# listen_mode = "0660"
+# pm_max_children = 3
+# php_ini = "/etc/php/8.3/fpm/php.ini"

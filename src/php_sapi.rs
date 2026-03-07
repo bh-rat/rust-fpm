@@ -5,8 +5,6 @@ use ext_php_rs::builders::SapiBuilder;
 use ext_php_rs::embed::SapiModule;
 use ext_php_rs::ffi::{
     sapi_header_struct, sapi_headers_struct, sapi_module_struct, sapi_startup,
-    zend_destroy_file_handle, zend_file_handle, zend_stream_init_filename,
-    php_execute_script, ZEND_RESULT_CODE_SUCCESS,
 };
 use ext_php_rs::types::Zval;
 
@@ -17,17 +15,21 @@ unsafe extern "C" {
         val: *const c_char,
         track_vars_array: *mut Zval,
     );
-    fn php_request_startup() -> c_int;
-    fn php_request_shutdown(dummy: *mut c_void);
     fn php_module_startup(sf: *mut sapi_module_struct, additional_module: *mut c_void) -> c_int;
     fn php_module_shutdown();
 }
 
-/// Get raw sapi_globals pointer, bypassing ext-php-rs RwLock wrappers.
-/// This is safe to call from PHP C callbacks.
+/// Get raw sapi_globals pointer for the current thread's PHP instance.
+/// Uses TLS to dispatch to the correct dlmopen namespace's globals.
+/// Falls back to the primary (linked) instance if no TLS is set.
 #[inline]
 unsafe fn raw_sapi_globals() -> *mut ext_php_rs::ffi::sapi_globals_struct {
-    unsafe { ext_php_rs::ffi::ext_php_rs_sapi_globals() }
+    let instance = crate::php_instance::current_instance();
+    if instance.is_null() {
+        unsafe { ext_php_rs::ffi::ext_php_rs_sapi_globals() }
+    } else {
+        unsafe { (*instance).sapi_globals }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +87,20 @@ impl RequestContext {
     /// reclaimed yet.
     pub unsafe fn from_raw(ptr: *mut c_void) -> Box<Self> {
         unsafe { Box::from_raw(ptr.cast::<Self>()) }
+    }
+
+    /// Create an error response without executing PHP.
+    /// Used by worker pool for panic recovery and channel errors.
+    pub fn error_response(status: u16, message: &str) -> Self {
+        Self {
+            params: HashMap::new(),
+            post_body: Vec::new(),
+            post_read_offset: 0,
+            output_buffer: message.as_bytes().to_vec(),
+            response_headers: Vec::new(),
+            http_status_code: status,
+            request_finished: true,
+        }
     }
 }
 
@@ -201,6 +217,7 @@ extern "C" fn sapi_read_cookies() -> *mut c_char {
 }
 
 /// Called by PHP to populate $_SERVER.
+/// Dispatches php_register_variable through TLS to support dlmopen'd instances.
 extern "C" fn sapi_register_server_variables(track_vars_array: *mut Zval) {
     let server_ctx = unsafe { (*raw_sapi_globals()).server_context };
     if server_ctx.is_null() {
@@ -208,11 +225,21 @@ extern "C" fn sapi_register_server_variables(track_vars_array: *mut Zval) {
     }
     let ctx = unsafe { RequestContext::from_server_context(server_ctx) };
 
+    // Get the correct php_register_variable for this thread's PHP instance
+    let register_fn: unsafe extern "C" fn(*const c_char, *const c_char, *mut Zval) = {
+        let instance = crate::php_instance::current_instance();
+        if instance.is_null() {
+            php_register_variable
+        } else {
+            unsafe { (*instance).fn_php_register_variable }
+        }
+    };
+
     for (key, value) in &ctx.params {
         if let (Ok(c_key), Ok(c_val)) = (CString::new(key.as_str()), CString::new(value.as_str()))
         {
             unsafe {
-                php_register_variable(c_key.as_ptr(), c_val.as_ptr(), track_vars_array);
+                register_fn(c_key.as_ptr(), c_val.as_ptr(), track_vars_array);
             }
         }
     }
@@ -223,7 +250,7 @@ extern "C" fn sapi_register_server_variables(track_vars_array: *mut Zval) {
         CString::new("rust-fpm/0.1.0"),
     ) {
         unsafe {
-            php_register_variable(name.as_ptr(), val.as_ptr(), track_vars_array);
+            register_fn(name.as_ptr(), val.as_ptr(), track_vars_array);
         }
     }
 }
@@ -296,10 +323,15 @@ extern "C" fn sapi_shutdown_cb(_sapi: *mut SapiModule) -> c_int {
 // Lifecycle functions — called from main.rs / fastcgi.rs
 // ---------------------------------------------------------------------------
 
-/// Initialize the PHP SAPI module. Call once at process start.
-/// Returns a raw pointer to the SapiModule (needed for shutdown).
-pub fn init_sapi(php_ini_path: Option<&str>) -> *mut SapiModule {
-    let mut builder = SapiBuilder::new("rust-fpm", "Rust FPM")
+/// Build a sapi_module_struct with all SAPI callbacks configured.
+/// Does NOT call any PHP lifecycle functions — just fills in the struct.
+/// Reused by both init_sapi() (primary) and PhpInstance::dlmopen() (per-worker).
+///
+/// `skip_ini_scan`: if true, sets `php_ini_ignore=1` so PHP won't load ini files
+/// from the scan directory. Used for dlmopen'd instances to avoid loading
+/// `zend_extension=opcache` which crashes in dlmopen'd namespaces.
+pub fn build_sapi_module(php_ini_path: Option<&str>, skip_ini_scan: bool) -> *mut SapiModule {
+    let mut builder = SapiBuilder::new("cgi-fcgi", "Rust FPM")
         .startup_function(sapi_startup_cb)
         .shutdown_function(sapi_shutdown_cb)
         .activate_function(sapi_activate)
@@ -313,7 +345,11 @@ pub fn init_sapi(php_ini_path: Option<&str>) -> *mut SapiModule {
         .register_server_variables_function(sapi_register_server_variables)
         .log_message_function(sapi_log_message);
 
-    if let Some(ini_path) = php_ini_path {
+    if skip_ini_scan {
+        // dlmopen'd instances: skip ini files to avoid loading zend_extension=opcache
+        // which segfaults in dlmopen'd namespaces. Basic settings come from ini_entries.
+        builder = builder.php_ini_ignore(1);
+    } else if let Some(ini_path) = php_ini_path {
         builder = builder.php_ini_path_override(ini_path);
     }
 
@@ -322,7 +358,13 @@ pub fn init_sapi(php_ini_path: Option<&str>) -> *mut SapiModule {
     );
 
     let sapi_module = builder.build().expect("Failed to build SAPI module");
-    let sapi_ptr = sapi_module.into_raw();
+    sapi_module.into_raw()
+}
+
+/// Initialize the PHP SAPI module (primary/linked instance). Call once at process start.
+/// Returns a raw pointer to the SapiModule (needed for PhpInstance::primary()).
+pub fn init_sapi(php_ini_path: Option<&str>) -> *mut SapiModule {
+    let sapi_ptr = build_sapi_module(php_ini_path, false);
 
     // Lifecycle sequence (from ext-php-rs/tests/sapi.rs):
     // 1. ext_php_rs_sapi_startup — signal setup, TSRM init
@@ -348,7 +390,8 @@ pub fn shutdown_sapi() {
 }
 
 /// Set sapi_globals.request_info fields before php_request_startup.
-fn init_request_info(ctx: &RequestContext) {
+/// Public for use by PhpInstance::execute_request().
+pub fn init_request_info(ctx: &RequestContext) {
     let sg = unsafe { &mut *raw_sapi_globals() };
 
     // Default status
@@ -414,77 +457,3 @@ fn init_request_info(ctx: &RequestContext) {
     sg.request_info.proto_num = 1001;
 }
 
-/// Execute a PHP request. Call from a blocking thread.
-/// Takes ownership of ctx, returns it after PHP execution with output populated.
-pub fn execute_request(ctx: RequestContext) -> RequestContext {
-    // 1. Set request_info fields
-    init_request_info(&ctx);
-
-    // 2. Store context in server_context
-    let ctx_ptr = ctx.into_raw();
-    unsafe { (*raw_sapi_globals()).server_context = ctx_ptr };
-
-    // 3. php_request_startup
-    let startup_result = unsafe { php_request_startup() };
-    if startup_result != ZEND_RESULT_CODE_SUCCESS {
-        tracing::error!("php_request_startup failed");
-        let mut ctx = unsafe { *RequestContext::from_raw(ctx_ptr) };
-        unsafe { (*raw_sapi_globals()).server_context = std::ptr::null_mut() };
-        ctx.http_status_code = 500;
-        ctx.output_buffer = b"PHP request startup failed".to_vec();
-        return ctx;
-    }
-
-    // 4. Get script filename from context
-    let script_filename = {
-        let sg = unsafe { &*raw_sapi_globals() };
-        if !sg.request_info.path_translated.is_null() {
-            unsafe { CStr::from_ptr(sg.request_info.path_translated) }
-                .to_string_lossy()
-                .to_string()
-        } else {
-            String::new()
-        }
-    };
-
-    // 5. Execute PHP script with fatal error recovery
-    if !script_filename.is_empty() {
-        if let Ok(path_cstr) = CString::new(script_filename.as_str()) {
-            let _catch = ext_php_rs::zend::try_catch_first(|| {
-                unsafe {
-                    let mut file_handle: zend_file_handle = std::mem::zeroed();
-                    zend_stream_init_filename(&raw mut file_handle, path_cstr.as_ptr());
-                    php_execute_script(&raw mut file_handle);
-                    zend_destroy_file_handle(&raw mut file_handle);
-                }
-            });
-            if let Err(ref e) = _catch {
-                tracing::error!("PHP bailout: {:?}", e);
-            }
-        }
-    }
-
-    // 6. Save the raw pointer before shutdown (deactivate will null server_context)
-    let saved_ptr = ctx_ptr;
-
-    // 7. php_request_shutdown (calls sapi_deactivate internally)
-    unsafe { php_request_shutdown(std::ptr::null_mut()) };
-
-    // 8. Free path_translated AFTER shutdown (Pasir pattern)
-    {
-        let sg = unsafe { &*raw_sapi_globals() };
-        if !sg.request_info.path_translated.is_null() {
-            unsafe { drop(CString::from_raw(sg.request_info.path_translated)) };
-        }
-    }
-
-    // 9. Reclaim context ownership from saved pointer
-    let ctx = unsafe { *RequestContext::from_raw(saved_ptr) };
-    tracing::debug!(
-        "execute_request done: status={}, output_len={}, headers={}",
-        ctx.http_status_code,
-        ctx.output_buffer.len(),
-        ctx.response_headers.len()
-    );
-    ctx
-}

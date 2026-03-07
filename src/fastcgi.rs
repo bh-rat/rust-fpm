@@ -3,11 +3,12 @@ use tokio::net::UnixListener;
 use tokio_fastcgi::{Requests, RequestResult};
 use anyhow::Result;
 
-use crate::php_sapi::{RequestContext, execute_request};
+use crate::php_sapi::RequestContext;
 use crate::request;
+use crate::worker_pool::WorkerPool;
 
-/// Start the FastCGI listener and process requests from NGINX.
-pub async fn serve(listen_path: &str) -> Result<()> {
+/// Start the FastCGI listener on a new socket and process requests via the worker pool.
+pub async fn serve(listen_path: &str, pool: Arc<WorkerPool>) -> Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(listen_path);
 
@@ -21,16 +22,33 @@ pub async fn serve(listen_path: &str) -> Result<()> {
         std::fs::set_permissions(listen_path, std::fs::Permissions::from_mode(0o666))?;
     }
 
+    accept_loop(listener, pool).await
+}
+
+/// Start the FastCGI listener on a pre-bound socket (used by pool_manager after privilege drop).
+pub async fn serve_on_listener(
+    listener: std::os::unix::net::UnixListener,
+    pool: Arc<WorkerPool>,
+) -> Result<()> {
+    listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(listener)?;
+    accept_loop(listener, pool).await
+}
+
+/// Core accept loop shared by both entry points.
+async fn accept_loop(listener: UnixListener, pool: Arc<WorkerPool>) -> Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await?;
         tracing::debug!("New FastCGI connection");
 
+        let pool = pool.clone();
         tokio::spawn(async move {
             let mut requests = Requests::from_split_socket(stream.into_split(), 10, 10);
 
             while let Ok(Some(request)) = requests.next().await {
+                let pool = pool.clone();
                 if let Err(e) = request
-                    .process(|req| async move { process_request(req).await })
+                    .process(|req| async move { process_request(req, pool).await })
                     .await
                 {
                     tracing::error!("FastCGI request error: {:?}", e);
@@ -42,6 +60,7 @@ pub async fn serve(listen_path: &str) -> Result<()> {
 
 async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     req: Arc<tokio_fastcgi::Request<W>>,
+    pool: Arc<WorkerPool>,
 ) -> RequestResult {
     // Extract params and POST body (sync — data already buffered)
     let params = request::extract_params(&req);
@@ -70,21 +89,9 @@ async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         return RequestResult::Complete(0);
     }
 
-    // Execute PHP in a thread with large stack (PHP 8.3+ needs >2MB for stack checks)
+    // Execute PHP via worker pool
     let ctx = RequestContext::new(params, post_body);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("php-worker".into())
-        .stack_size(16 * 1024 * 1024) // 16MB stack for PHP
-        .spawn(move || {
-            // Each thread running PHP must initialize its own PHP context
-            unsafe { ext_php_rs::embed::ext_php_rs_sapi_per_thread_init() };
-            let result = execute_request(ctx);
-            unsafe { ext_php_rs::embed::ext_php_rs_sapi_per_thread_shutdown() };
-            let _ = tx.send(result);
-        })
-        .expect("Failed to spawn PHP worker thread");
-    let result = rx.await;
+    let result = pool.execute(ctx).await;
 
     match result {
         Ok(ctx) => {
@@ -93,7 +100,7 @@ async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
             RequestResult::Complete(0)
         }
         Err(e) => {
-            tracing::error!("PHP worker failed: {:?}", e);
+            tracing::error!("Pool execute error: {:?}", e);
             let _ = req
                 .get_stdout()
                 .write(b"Status: 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nInternal error")
