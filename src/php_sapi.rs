@@ -19,17 +19,11 @@ unsafe extern "C" {
     fn php_module_shutdown();
 }
 
-/// Get raw sapi_globals pointer for the current thread's PHP instance.
-/// Uses TLS to dispatch to the correct dlmopen namespace's globals.
-/// Falls back to the primary (linked) instance if no TLS is set.
+/// Get raw sapi_globals pointer for this process's PHP instance.
+/// After fork, each process has exactly one set of PHP globals.
 #[inline]
 unsafe fn raw_sapi_globals() -> *mut ext_php_rs::ffi::sapi_globals_struct {
-    let instance = crate::php_instance::current_instance();
-    if instance.is_null() {
-        unsafe { ext_php_rs::ffi::ext_php_rs_sapi_globals() }
-    } else {
-        unsafe { (*instance).sapi_globals }
-    }
+    unsafe { ext_php_rs::ffi::ext_php_rs_sapi_globals() }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,21 +219,11 @@ extern "C" fn sapi_register_server_variables(track_vars_array: *mut Zval) {
     }
     let ctx = unsafe { RequestContext::from_server_context(server_ctx) };
 
-    // Get the correct php_register_variable for this thread's PHP instance
-    let register_fn: unsafe extern "C" fn(*const c_char, *const c_char, *mut Zval) = {
-        let instance = crate::php_instance::current_instance();
-        if instance.is_null() {
-            php_register_variable
-        } else {
-            unsafe { (*instance).fn_php_register_variable }
-        }
-    };
-
     for (key, value) in &ctx.params {
         if let (Ok(c_key), Ok(c_val)) = (CString::new(key.as_str()), CString::new(value.as_str()))
         {
             unsafe {
-                register_fn(c_key.as_ptr(), c_val.as_ptr(), track_vars_array);
+                php_register_variable(c_key.as_ptr(), c_val.as_ptr(), track_vars_array);
             }
         }
     }
@@ -250,7 +234,7 @@ extern "C" fn sapi_register_server_variables(track_vars_array: *mut Zval) {
         CString::new("rust-fpm/0.1.0"),
     ) {
         unsafe {
-            register_fn(name.as_ptr(), val.as_ptr(), track_vars_array);
+            php_register_variable(name.as_ptr(), val.as_ptr(), track_vars_array);
         }
     }
 }
@@ -325,12 +309,7 @@ extern "C" fn sapi_shutdown_cb(_sapi: *mut SapiModule) -> c_int {
 
 /// Build a sapi_module_struct with all SAPI callbacks configured.
 /// Does NOT call any PHP lifecycle functions — just fills in the struct.
-/// Reused by both init_sapi() (primary) and PhpInstance::dlmopen() (per-worker).
-///
-/// `skip_ini_scan`: if true, sets `php_ini_ignore=1` so PHP won't load ini files
-/// from the scan directory. Used for dlmopen'd instances to avoid loading
-/// `zend_extension=opcache` which crashes in dlmopen'd namespaces.
-pub fn build_sapi_module(php_ini_path: Option<&str>, skip_ini_scan: bool) -> *mut SapiModule {
+pub fn build_sapi_module(php_ini_path: Option<&str>) -> *mut SapiModule {
     let mut builder = SapiBuilder::new("cgi-fcgi", "Rust FPM")
         .startup_function(sapi_startup_cb)
         .shutdown_function(sapi_shutdown_cb)
@@ -345,11 +324,7 @@ pub fn build_sapi_module(php_ini_path: Option<&str>, skip_ini_scan: bool) -> *mu
         .register_server_variables_function(sapi_register_server_variables)
         .log_message_function(sapi_log_message);
 
-    if skip_ini_scan {
-        // dlmopen'd instances: skip ini files to avoid loading zend_extension=opcache
-        // which segfaults in dlmopen'd namespaces. Basic settings come from ini_entries.
-        builder = builder.php_ini_ignore(1);
-    } else if let Some(ini_path) = php_ini_path {
+    if let Some(ini_path) = php_ini_path {
         builder = builder.php_ini_path_override(ini_path);
     }
 
@@ -364,7 +339,7 @@ pub fn build_sapi_module(php_ini_path: Option<&str>, skip_ini_scan: bool) -> *mu
 /// Initialize the PHP SAPI module (primary/linked instance). Call once at process start.
 /// Returns a raw pointer to the SapiModule (needed for PhpInstance::primary()).
 pub fn init_sapi(php_ini_path: Option<&str>) -> *mut SapiModule {
-    let sapi_ptr = build_sapi_module(php_ini_path, false);
+    let sapi_ptr = build_sapi_module(php_ini_path);
 
     // Lifecycle sequence (from ext-php-rs/tests/sapi.rs):
     // 1. ext_php_rs_sapi_startup — signal setup, TSRM init

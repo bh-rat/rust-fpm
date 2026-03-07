@@ -185,9 +185,4 @@ impl Config {
 
         Ok(Config { global, pools })
     }
-
-    /// Returns true if we need fork/privilege-drop (any pool has a user field).
-    pub fn needs_multi_process(&self) -> bool {
-        self.pools.iter().any(|p| p.user.is_some())
-    }
 }

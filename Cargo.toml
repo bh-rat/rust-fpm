@@ -43,7 +43,7 @@ bytes = "1"
 # Unix process management - fork, setuid/setgid, waitpid, signals
 nix = { version = "0.29", features = ["user", "process", "signal", "fs"] }
 
-# Low-level libc FFI - dlmopen, dlsym, sigsetjmp for PHP instance isolation
+# Low-level libc FFI - setjmp for PHP fatal error recovery
 libc = "0.2"
 
 [features]
