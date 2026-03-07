@@ -1,0 +1,51 @@
+[package]
+name = "rust-fpm"
+version = "0.1.0"
+edition = "2024"
+description = "A drop-in replacement for php-fpm, built in Rust"
+license = "Apache-2.0"
+
+[dependencies]
+# PHP embedding - wraps libphp.so in safe Rust bindings
+ext-php-rs = { version = "0.15.1", default-features = false, features = ["embed"] }
+
+# FastCGI responder - accepts FastCGI connections from NGINX
+tokio-fastcgi = "1.3.0"
+
+# Async runtime - handles thousands of connections with few threads
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "signal",
+    "macros",
+    "time",
+] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Config file parsing (php-fpm.conf compatible)
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+
+# Byte manipulation for FastCGI streams
+bytes = "1"
+
+[features]
+default = []
+static = ["ext-php-rs/static"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

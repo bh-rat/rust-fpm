@@ -1,0 +1,17 @@
+[global]
+pid = "/var/run/rust-fpm.pid"
+error_log = "/var/log/rust-fpm/error.log"
+
+[www]
+listen = "/var/run/php-fpm.sock"
+listen_owner = "www-data"
+listen_group = "www-data"
+
+pm = "dynamic"
+pm_max_children = 5
+pm_start_servers = 2
+pm_min_spare_servers = 1
+pm_max_spare_servers = 3
+
+request_terminate_timeout = "60s"
+php_ini = "/etc/php/8.3/fpm/php.ini"
