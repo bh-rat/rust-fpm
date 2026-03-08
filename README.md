@@ -1,12 +1,12 @@
 # rust-fpm
 
-A drop-in replacement for php-fpm, built in Rust. Same NGINX config, same Unix socket, same WordPress — 76% less memory.
+An experimental drop-in replacement for php-fpm, built in Rust. Uses the same NGINX configuration and Unix socket interface.
 
 ## What This Is
 
-rust-fpm embeds the PHP interpreter (libphp.so) inside a Rust binary and serves FastCGI requests on a Unix socket, exactly like php-fpm does. NGINX doesn't know the difference. WordPress, Laravel, Drupal — any PHP application runs without modification.
+rust-fpm embeds the PHP interpreter (libphp.so) inside a Rust binary and serves FastCGI requests on a Unix socket, the same way php-fpm does. It implements PHP's SAPI interface — the callback layer that php-fpm, Apache mod_php, and the CLI all use — so existing PHP applications work without modification.
 
-The key difference is architecture. php-fpm forks a separate process for every worker, each carrying a full copy of the PHP runtime in memory. rust-fpm uses a single process with a custom SAPI (Server API) built on [ext-php-rs](https://github.com/davidcole1340/ext-php-rs), sharing OPcache across all workers. The result: you can run 4-8x more workers in the same RAM.
+The project explores whether a Rust-based process manager can reduce per-worker memory overhead compared to php-fpm's fork-per-worker model. It is not production-ready.
 
 ## How It Works
 
@@ -23,78 +23,80 @@ NGINX ──FastCGI──> Unix Socket ──> rust-fpm ──> PHP (libphp.so)
                                       └── Send response back through FastCGI
 ```
 
-rust-fpm implements PHP's SAPI interface — the same callback layer that php-fpm, Apache mod_php, and the CLI all implement. The custom SAPI handles output capture (`ub_write`), POST body reading (`read_post`), header collection (`send_header`), `$_SERVER` population (`register_server_variables`), and fatal error recovery via `setjmp`/`longjmp`.
+The custom SAPI handles output capture (`ub_write`), POST body reading (`read_post`), header collection (`send_header`), `$_SERVER` population (`register_server_variables`), and fatal error recovery via `setjmp`/`longjmp`. It uses [ext-php-rs](https://github.com/davidcole1340/ext-php-rs) for PHP bindings and [tokio-fastcgi](https://crates.io/crates/tokio-fastcgi) for the FastCGI protocol.
 
-Two execution models are available:
+Two execution models exist:
 
-- **NTS fork model** (`main` branch): Master process initializes PHP and OPcache, then forks N workers. Each worker inherits the shared OPcache SHM and runs a Tokio runtime with one blocking thread. Same isolation guarantees as php-fpm.
-- **ZTS thread model** (`zts-threads` branch): Single process, N blocking threads with per-thread PHP globals via TSRM. Requires ZTS-compiled PHP. Lower memory footprint, higher effective concurrency.
+- **NTS fork model** (`main` branch): Master process initializes PHP and OPcache, then forks N workers. Each worker inherits shared OPcache SHM and runs a Tokio runtime with one blocking thread.
+- **ZTS thread model** (`zts-threads` branch): Single process, N blocking threads with per-thread PHP globals via TSRM. Requires ZTS-compiled PHP.
 
 ## Benchmark Results
 
-Tested on WordPress 6.x homepage, PHP 8.3.15, MariaDB 10.11, Docker on Apple Silicon. OPcache enabled (128MB, JIT disabled) for all configurations.
+All benchmarks run in Docker on Apple Silicon (not bare metal). Numbers have 10-20% run-to-run variance in this environment. Take them as directional, not absolute.
+
+Tested with WordPress 6.x homepage, PHP 8.3.15, MariaDB 10.11. OPcache enabled (128MB, JIT disabled) for both php-fpm and rust-fpm.
 
 ### ZTS Thread Model vs php-fpm (ZTS)
 
-**WordPress homepage, wrk -t2 -d30s:**
+**WordPress homepage (wrk -t2 -d30s):**
 
-| Workers | php-fpm req/s | php-fpm RSS | rust-fpm req/s | rust-fpm RSS | Memory Savings |
-|---------|--------------|-------------|---------------|-------------|----------------|
-| 4       | 139          | 181 MB      | 134           | 105 MB      | 42%            |
-| 8       | 191          | 349 MB      | 162           | 143 MB      | 59%            |
-| 16      | 189          | 683 MB      | 192           | 203 MB      | 70%            |
-| 32      | 159          | 1352 MB     | 163           | 319 MB      | **76%**        |
+| Workers | php-fpm req/s | php-fpm RSS | rust-fpm req/s | rust-fpm RSS |
+|---------|--------------|-------------|---------------|-------------|
+| 4       | 139          | 181 MB      | 134           | 105 MB      |
+| 8       | 191          | 349 MB      | 162           | 143 MB      |
+| 16      | 189          | 683 MB      | ~120-192*     | 203 MB      |
+| 32      | 159          | 1352 MB     | ~138-163*     | 319 MB      |
 
-**I/O-heavy workloads (10 MySQL queries per request):**
+*High variance at 16+ workers in Docker. Needs bare-metal validation.
+
+**10 MySQL queries per request:**
 
 | Workers | php-fpm req/s | rust-fpm req/s |
 |---------|--------------|---------------|
 | 4       | 1,753        | 1,548         |
-| 32      | 1,162        | **2,520**     |
+| 32      | 1,162        | 2,520         |
 
-At 32 workers with database-heavy workloads, rust-fpm delivers 2.2x the throughput of php-fpm.
+### What the data shows
 
-**The value proposition**: at equal memory budget, rust-fpm runs more workers and serves more requests. php-fpm needs 1.3 GB for 32 workers; rust-fpm needs 319 MB.
+- **Throughput**: rust-fpm is roughly 5-15% slower than php-fpm on WordPress at low worker counts. At higher worker counts and I/O-heavy workloads, the gap narrows or reverses. The WordPress throughput gap is partly explained by response buffering overhead (rust-fpm buffers the full response before sending; php-fpm streams directly to the socket).
+- **Memory**: rust-fpm uses less RSS than php-fpm at every worker count tested. php-fpm RSS scales roughly linearly with worker count; rust-fpm scales sub-linearly because threads share the process address space.
+- **Not tested**: production traffic patterns, long-running requests, file uploads, high-concurrency edge cases, bare-metal performance.
 
 ## Installation
 
-rust-fpm requires Linux with PHP compiled using `--enable-embed=shared`. macOS does not ship the embed SAPI — use the provided Docker environment for development.
+Requires Linux with PHP compiled using `--enable-embed=shared`. macOS does not ship the embed SAPI — use the provided Docker environment.
 
-### Docker (recommended)
+### Docker
 
 ```bash
 git clone https://github.com/bh-rat/rust-fpm.git
 cd rust-fpm
 
-# Start development container with PHP embed + MariaDB
+# Start dev container with PHP embed + MariaDB
 cd test-env
 docker compose up -d
 docker compose exec dev bash
 
-# Inside the container:
+# Inside container:
 cd /rust-fpm
 cargo build --release
 ./setup-wordpress.sh
-
-# Run rust-fpm
 ./target/release/rust-fpm --listen /var/run/php-fpm.sock --workers 4
 ```
 
-WordPress is now served via NGINX on port 8080.
+WordPress is served via NGINX on port 8080.
 
 ### Configuration
 
-rust-fpm accepts php-fpm-compatible TOML configuration:
-
 ```bash
-# CLI usage
+# CLI
 rust-fpm --listen /var/run/php-fpm.sock --workers 4
 
-# Or with a config file
+# Config file
 rust-fpm --config /etc/rust-fpm/www.conf
 ```
 
-NGINX configuration is identical to php-fpm — just point `fastcgi_pass` at the socket:
+NGINX config is identical to php-fpm:
 
 ```nginx
 location ~ \.php$ {
@@ -108,7 +110,7 @@ location ~ \.php$ {
 
 ```
 src/
-├── main.rs           # Entry point, runtime setup, jemalloc
+├── main.rs           # Entry point, runtime setup, jemalloc allocator
 ├── config.rs         # TOML config parsing (php-fpm compatible keys)
 ├── fastcgi.rs        # FastCGI accept loop, response formatting
 ├── php_sapi.rs       # Custom SAPI callbacks (ub_write, read_post, etc.)
@@ -118,30 +120,24 @@ src/
 └── reset.rs          # Per-request state cleanup
 ```
 
-## Testing
+## Known Limitations
 
-The `test-env/test-scripts/` directory covers WordPress edge cases:
-
-- POST body handling and file uploads
-- Session persistence across requests
-- Cookie round-trips
-- Custom header emission (`header()` after output)
-- Error handling and fatal error recovery
-- Per-request state isolation
-- MySQL query workloads (configurable query count)
-- OPcache status verification
+- No `php://input` stream support (raw POST body not accessible)
+- No file upload handling
+- No `getallheaders()` implementation
+- No request timeout enforcement
+- No graceful reload (SIGHUP)
+- Benchmarks are Docker-only; bare-metal numbers needed
+- Not tested with PHP extensions beyond core + OPcache + mysqli
 
 ## Future Work
 
-- [ ] Benchmark against FrankenPHP (classic mode) on WordPress
-- [ ] Apply performance optimizations to NTS fork model
-- [ ] `php://input` stream support for raw POST body access
-- [ ] File upload handling with temp file management
-- [ ] `getallheaders()` implementation in SAPI
-- [ ] Configurable request timeouts (`request_terminate_timeout`)
-- [ ] Graceful reload (finish in-flight requests on SIGHUP)
-- [ ] Connection pooling for persistent MySQL connections
-- [ ] ARM64 and x86_64 prebuilt binaries
+- [ ] Bare-metal benchmarks on Linux
+- [ ] Benchmark against FrankenPHP (classic mode)
+- [ ] Apply optimizations to NTS fork model
+- [ ] File upload and `php://input` support
+- [ ] Request timeouts
+- [ ] Graceful reload
 
 ## License
 
