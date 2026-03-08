@@ -1,9 +1,38 @@
+use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 use ext_php_rs::ffi::{__jmp_buf_tag, zend_file_handle};
 use tracing::error;
 
 use crate::php_sapi::{self, RequestContext};
+
+// ---------------------------------------------------------------------------
+// ZTS thread initialization — ensure TSRM context exists for this thread
+// ---------------------------------------------------------------------------
+
+/// Guard that calls per_thread_shutdown when the thread exits.
+struct PhpThreadGuard;
+
+impl Drop for PhpThreadGuard {
+    fn drop(&mut self) {
+        unsafe { ext_php_rs::embed::ext_php_rs_sapi_per_thread_shutdown() };
+    }
+}
+
+thread_local! {
+    static PHP_THREAD_GUARD: RefCell<Option<PhpThreadGuard>> = const { RefCell::new(None) };
+}
+
+/// Ensure the current thread has a TSRM context (ZTS builds only).
+/// Under NTS builds, `ext_php_rs_sapi_per_thread_init()` is a no-op.
+fn ensure_php_thread_init() {
+    PHP_THREAD_GUARD.with(|guard| {
+        if guard.borrow().is_none() {
+            unsafe { ext_php_rs::embed::ext_php_rs_sapi_per_thread_init() };
+            *guard.borrow_mut() = Some(PhpThreadGuard);
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // FFI — setjmp (C standard) and PHP lifecycle functions (linked libphp.so)
@@ -17,7 +46,6 @@ unsafe extern "C" {
     fn php_request_shutdown(dummy: *mut c_void);
     fn php_execute_script(primary_file: *mut zend_file_handle) -> bool;
     fn zend_stream_init_filename(handle: *mut zend_file_handle, filename: *const c_char);
-    fn zend_destroy_file_handle(handle: *mut zend_file_handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -27,6 +55,8 @@ unsafe extern "C" {
 /// Execute a PHP request using this process's inherited PHP instance.
 /// Each forked worker process has exactly one PHP context (inherited from master).
 pub fn execute_request(ctx: RequestContext) -> RequestContext {
+    ensure_php_thread_init();
+
     let sapi_globals = unsafe { ext_php_rs::ffi::ext_php_rs_sapi_globals() };
 
     // 1. Set request_info fields
@@ -66,8 +96,8 @@ pub fn execute_request(ctx: RequestContext) -> RequestContext {
                 try_catch_first(|| {
                     let mut file_handle: zend_file_handle = std::mem::zeroed();
                     zend_stream_init_filename(&raw mut file_handle, path_cstr.as_ptr());
+                    // php_execute_script calls zend_destroy_file_handle internally
                     php_execute_script(&raw mut file_handle);
-                    zend_destroy_file_handle(&raw mut file_handle);
                 })
             };
             if catch_result.is_err() {
@@ -91,14 +121,7 @@ pub fn execute_request(ctx: RequestContext) -> RequestContext {
     }
 
     // 9. Reclaim context
-    let ctx = unsafe { *RequestContext::from_raw(saved_ptr) };
-    tracing::debug!(
-        "execute_request done: status={}, output_len={}, headers={}",
-        ctx.http_status_code,
-        ctx.output_buffer.len(),
-        ctx.response_headers.len()
-    );
-    ctx
+    unsafe { *RequestContext::from_raw(saved_ptr) }
 }
 
 // ---------------------------------------------------------------------------
