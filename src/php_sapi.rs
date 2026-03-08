@@ -39,8 +39,8 @@ pub struct RequestContext {
     pub post_read_offset: usize,
     /// Captured PHP output
     pub output_buffer: Vec<u8>,
-    /// Captured response headers ("Name: Value" strings)
-    pub response_headers: Vec<String>,
+    /// Captured response headers ("Name: Value" byte strings)
+    pub response_headers: Vec<Vec<u8>>,
     /// HTTP status code from PHP
     pub http_status_code: u16,
     /// Set by deactivate when request lifecycle ends
@@ -140,10 +140,8 @@ extern "C" fn sapi_send_header(header: *mut sapi_header_struct, server_context: 
     let header_bytes = unsafe {
         std::slice::from_raw_parts(sapi_header.header.cast::<u8>(), sapi_header.header_len)
     };
-    if let Ok(header_str) = std::str::from_utf8(header_bytes) {
-        let ctx = unsafe { RequestContext::from_server_context(server_context) };
-        ctx.response_headers.push(header_str.to_string());
-    }
+    let ctx = unsafe { RequestContext::from_server_context(server_context) };
+    ctx.response_headers.push(header_bytes.to_vec());
 }
 
 /// Called by PHP when all headers are finalized — capture status code.

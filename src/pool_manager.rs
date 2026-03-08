@@ -48,9 +48,16 @@ pub async fn run_threaded(
         config.pools.iter().map(|p| p.pm_max_children).sum::<usize>()
     );
 
-    // Wait for shutdown signal
-    signal::ctrl_c().await?;
-    info!("Received shutdown signal");
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down");
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down");
+        }
+    }
 
     // Cleanup PID file
     if let Some(ref pid_path) = config.global.pid {

@@ -46,6 +46,12 @@ nix = { version = "0.29", features = ["user", "process", "signal", "fs"] }
 # Low-level libc FFI - setjmp for PHP fatal error recovery
 libc = "0.2"
 
+# Fast integer-to-string conversion (avoids format! allocation)
+itoa = "1"
+
+# High-performance allocator with thread-local caching
+tikv-jemallocator = "0.6"
+
 [features]
 default = []
 static = ["ext-php-rs/static"]

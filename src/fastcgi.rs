@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::net::UnixListener;
 use tokio_fastcgi::{Requests, RequestResult};
 use anyhow::Result;
@@ -36,13 +35,9 @@ pub async fn serve(listener: std::os::unix::net::UnixListener) -> Result<()> {
 async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     req: Arc<tokio_fastcgi::Request<W>>,
 ) -> RequestResult {
-    let t0 = Instant::now();
-
     // Extract params and POST body (sync — data already buffered)
     let params = request::extract_params(&req);
     let post_body = request::read_stdin(&req);
-
-    let t1 = Instant::now(); // T1: params extracted
 
     let method = params
         .get("REQUEST_METHOD")
@@ -69,37 +64,18 @@ async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
 
     // Execute PHP via spawn_blocking (blocks one thread, Tokio handles IO)
     let ctx = RequestContext::new(params, post_body);
-    let t2 = Instant::now(); // T2: about to enter spawn_blocking
 
     let result = tokio::task::spawn_blocking(move || {
-        let t3 = Instant::now(); // T3: inside blocking thread
-        let ctx = crate::php_instance::execute_request(ctx);
-        let t4 = Instant::now(); // T4: PHP done
-        (ctx, t3, t4)
+        crate::php_instance::execute_request(ctx)
     })
     .await;
 
-    let t5 = Instant::now(); // T5: spawn_blocking returned
-
     match result {
-        Ok((ctx, t3, t4)) => {
-            let response = format_response(&ctx);
-            let t6 = Instant::now(); // T6: response formatted
-            let _ = req.get_stdout().write(&response).await;
-            let t7 = Instant::now(); // T7: response written
-
-            // Log timing breakdown
-            tracing::info!(
-                "TIMING: total={:.2}ms | params={:.2}ms | handoff={:.2}ms | php={:.2}ms | return={:.2}ms | format={:.2}ms | write={:.2}ms | output={}B",
-                t7.duration_since(t0).as_secs_f64() * 1000.0,
-                t1.duration_since(t0).as_secs_f64() * 1000.0,
-                t3.duration_since(t2).as_secs_f64() * 1000.0,
-                t4.duration_since(t3).as_secs_f64() * 1000.0,
-                t5.duration_since(t4).as_secs_f64() * 1000.0,
-                t6.duration_since(t5).as_secs_f64() * 1000.0,
-                t7.duration_since(t6).as_secs_f64() * 1000.0,
-                response.len(),
-            );
+        Ok(ctx) => {
+            // Write headers and body separately — avoids copying the entire body
+            let headers = format_headers(&ctx);
+            let _ = req.get_stdout().write(&headers).await;
+            let _ = req.get_stdout().write(&ctx.output_buffer).await;
 
             RequestResult::Complete(0)
         }
@@ -114,37 +90,39 @@ async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     }
 }
 
-/// Format the HTTP response for FastCGI STDOUT.
-/// Format: Status: NNN\r\nHeader: Value\r\n\r\nBody
-fn format_response(ctx: &RequestContext) -> Vec<u8> {
-    let mut response = Vec::with_capacity(ctx.output_buffer.len() + 1024);
+/// Format just the HTTP headers for FastCGI STDOUT (no body copy).
+/// Format: Status: NNN Reason\r\nHeader: Value\r\n...\r\n
+fn format_headers(ctx: &RequestContext) -> Vec<u8> {
+    let mut headers = Vec::with_capacity(1024);
 
-    // Status line
-    let status_text = match ctx.http_status_code {
-        200 => "OK",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "OK",
-    };
-    response.extend_from_slice(
-        format!("Status: {} {}\r\n", ctx.http_status_code, status_text).as_bytes(),
-    );
+    // Status line — write directly without format! allocation
+    headers.extend_from_slice(b"Status: ");
+    let mut buf = itoa::Buffer::new();
+    headers.extend_from_slice(buf.format(ctx.http_status_code).as_bytes());
+    headers.extend_from_slice(b" ");
+    headers.extend_from_slice(match ctx.http_status_code {
+        200 => b"OK" as &[u8],
+        301 => b"Moved Permanently",
+        302 => b"Found",
+        304 => b"Not Modified",
+        400 => b"Bad Request",
+        401 => b"Unauthorized",
+        403 => b"Forbidden",
+        404 => b"Not Found",
+        500 => b"Internal Server Error",
+        502 => b"Bad Gateway",
+        503 => b"Service Unavailable",
+        _ => b"OK",
+    });
+    headers.extend_from_slice(b"\r\n");
 
     // Response headers from PHP
     let mut has_content_type = false;
     for header in &ctx.response_headers {
-        response.extend_from_slice(header.as_bytes());
-        response.extend_from_slice(b"\r\n");
+        headers.extend_from_slice(header);
+        headers.extend_from_slice(b"\r\n");
         if header.len() > 12
-            && header.as_bytes()[..12].eq_ignore_ascii_case(b"content-type")
+            && header[..12].eq_ignore_ascii_case(b"content-type")
         {
             has_content_type = true;
         }
@@ -152,14 +130,11 @@ fn format_response(ctx: &RequestContext) -> Vec<u8> {
 
     // Default Content-Type if PHP didn't set one
     if !has_content_type {
-        response.extend_from_slice(b"Content-Type: text/html; charset=UTF-8\r\n");
+        headers.extend_from_slice(b"Content-Type: text/html; charset=UTF-8\r\n");
     }
 
     // Blank line separating headers from body
-    response.extend_from_slice(b"\r\n");
+    headers.extend_from_slice(b"\r\n");
 
-    // Body
-    response.extend_from_slice(&ctx.output_buffer);
-
-    response
+    headers
 }
