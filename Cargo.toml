@@ -3,7 +3,7 @@ name = "rust-fpm"
 version = "0.1.0"
 edition = "2024"
 description = "A drop-in replacement for php-fpm, built in Rust"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 # PHP embedding - wraps libphp.so in safe Rust bindings
