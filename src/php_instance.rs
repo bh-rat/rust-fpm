@@ -1,9 +1,31 @@
+use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::time::Instant;
 
 use ext_php_rs::ffi::{__jmp_buf_tag, zend_file_handle};
 use tracing::error;
 
 use crate::php_sapi::{self, RequestContext};
+
+// ---------------------------------------------------------------------------
+// ZTS thread initialization — ensure TSRM context exists for this thread
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static PHP_THREAD_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Ensure the current thread has a TSRM context (ZTS builds only).
+/// Under NTS builds, `ext_php_rs_sapi_per_thread_init()` is a no-op.
+/// After fork(), child threads need their own TSRM context.
+fn ensure_php_thread_init() {
+    PHP_THREAD_INITIALIZED.with(|init| {
+        if !init.get() {
+            unsafe { ext_php_rs::embed::ext_php_rs_sapi_per_thread_init() };
+            init.set(true);
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // FFI — setjmp (C standard) and PHP lifecycle functions (linked libphp.so)
@@ -27,6 +49,9 @@ unsafe extern "C" {
 /// Execute a PHP request using this process's inherited PHP instance.
 /// Each forked worker process has exactly one PHP context (inherited from master).
 pub fn execute_request(ctx: RequestContext) -> RequestContext {
+    ensure_php_thread_init();
+
+    let te0 = Instant::now();
     let sapi_globals = unsafe { ext_php_rs::ffi::ext_php_rs_sapi_globals() };
 
     // 1. Set request_info fields
@@ -35,6 +60,8 @@ pub fn execute_request(ctx: RequestContext) -> RequestContext {
     // 2. Store context in server_context
     let ctx_ptr = ctx.into_raw();
     unsafe { (*sapi_globals).server_context = ctx_ptr };
+
+    let te1 = Instant::now(); // after init_request_info
 
     // 3. php_request_startup
     let startup_result = unsafe { php_request_startup() };
@@ -46,6 +73,8 @@ pub fn execute_request(ctx: RequestContext) -> RequestContext {
         ctx.output_buffer = b"PHP request startup failed".to_vec();
         return ctx;
     }
+
+    let te2 = Instant::now(); // after php_request_startup
 
     // 4. Get script filename
     let script_filename = {
@@ -76,11 +105,15 @@ pub fn execute_request(ctx: RequestContext) -> RequestContext {
         }
     }
 
+    let te3 = Instant::now(); // after script execution
+
     // 6. Save pointer before shutdown (deactivate nulls server_context)
     let saved_ptr = ctx_ptr;
 
     // 7. php_request_shutdown
     unsafe { php_request_shutdown(std::ptr::null_mut()) };
+
+    let te4 = Instant::now(); // after php_request_shutdown
 
     // 8. Free path_translated after shutdown
     {
@@ -92,12 +125,17 @@ pub fn execute_request(ctx: RequestContext) -> RequestContext {
 
     // 9. Reclaim context
     let ctx = unsafe { *RequestContext::from_raw(saved_ptr) };
-    tracing::debug!(
-        "execute_request done: status={}, output_len={}, headers={}",
-        ctx.http_status_code,
-        ctx.output_buffer.len(),
-        ctx.response_headers.len()
+
+    // Log PHP-internal timing breakdown
+    tracing::info!(
+        "PHP_TIMING: init_req={:.2}ms | startup={:.2}ms | execute={:.2}ms | shutdown={:.2}ms | total={:.2}ms",
+        te1.duration_since(te0).as_secs_f64() * 1000.0,
+        te2.duration_since(te1).as_secs_f64() * 1000.0,
+        te3.duration_since(te2).as_secs_f64() * 1000.0,
+        te4.duration_since(te3).as_secs_f64() * 1000.0,
+        te4.duration_since(te0).as_secs_f64() * 1000.0,
     );
+
     ctx
 }
 

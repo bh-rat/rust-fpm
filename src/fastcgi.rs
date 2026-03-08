@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::UnixListener;
 use tokio_fastcgi::{Requests, RequestResult};
 use anyhow::Result;
@@ -6,36 +7,42 @@ use anyhow::Result;
 use crate::php_sapi::RequestContext;
 use crate::request;
 
-/// Worker-process accept loop. Each forked worker calls this to serve requests.
-/// PHP executes via spawn_blocking (one request at a time per process).
-pub async fn serve_worker(listener: std::os::unix::net::UnixListener) -> Result<()> {
+/// Accept loop for thread-based model. Spawns each connection concurrently.
+/// PHP executes via spawn_blocking — Tokio's blocking thread pool provides concurrency.
+pub async fn serve(listener: std::os::unix::net::UnixListener) -> Result<()> {
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
-    tracing::info!("Worker accepting FastCGI connections");
+    tracing::info!("Accepting FastCGI connections");
 
     loop {
         let (stream, _) = listener.accept().await?;
         tracing::debug!("New FastCGI connection");
 
-        // Process this connection's requests sequentially
-        let mut requests = Requests::from_split_socket(stream.into_split(), 10, 10);
-        while let Ok(Some(request)) = requests.next().await {
-            if let Err(e) = request
-                .process(|req| async move { process_request(req).await })
-                .await
-            {
-                tracing::error!("FastCGI request error: {:?}", e);
+        // Spawn each connection concurrently — multiple PHP requests in flight
+        tokio::spawn(async move {
+            let mut requests = Requests::from_split_socket(stream.into_split(), 10, 10);
+            while let Ok(Some(request)) = requests.next().await {
+                if let Err(e) = request
+                    .process(|req| async move { process_request(req).await })
+                    .await
+                {
+                    tracing::error!("FastCGI request error: {:?}", e);
+                }
             }
-        }
+        });
     }
 }
 
 async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     req: Arc<tokio_fastcgi::Request<W>>,
 ) -> RequestResult {
+    let t0 = Instant::now();
+
     // Extract params and POST body (sync — data already buffered)
     let params = request::extract_params(&req);
     let post_body = request::read_stdin(&req);
+
+    let t1 = Instant::now(); // T1: params extracted
 
     let method = params
         .get("REQUEST_METHOD")
@@ -62,15 +69,38 @@ async fn process_request<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
 
     // Execute PHP via spawn_blocking (blocks one thread, Tokio handles IO)
     let ctx = RequestContext::new(params, post_body);
+    let t2 = Instant::now(); // T2: about to enter spawn_blocking
+
     let result = tokio::task::spawn_blocking(move || {
-        crate::php_instance::execute_request(ctx)
+        let t3 = Instant::now(); // T3: inside blocking thread
+        let ctx = crate::php_instance::execute_request(ctx);
+        let t4 = Instant::now(); // T4: PHP done
+        (ctx, t3, t4)
     })
     .await;
 
+    let t5 = Instant::now(); // T5: spawn_blocking returned
+
     match result {
-        Ok(ctx) => {
+        Ok((ctx, t3, t4)) => {
             let response = format_response(&ctx);
+            let t6 = Instant::now(); // T6: response formatted
             let _ = req.get_stdout().write(&response).await;
+            let t7 = Instant::now(); // T7: response written
+
+            // Log timing breakdown
+            tracing::info!(
+                "TIMING: total={:.2}ms | params={:.2}ms | handoff={:.2}ms | php={:.2}ms | return={:.2}ms | format={:.2}ms | write={:.2}ms | output={}B",
+                t7.duration_since(t0).as_secs_f64() * 1000.0,
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+                t3.duration_since(t2).as_secs_f64() * 1000.0,
+                t4.duration_since(t3).as_secs_f64() * 1000.0,
+                t5.duration_since(t4).as_secs_f64() * 1000.0,
+                t6.duration_since(t5).as_secs_f64() * 1000.0,
+                t7.duration_since(t6).as_secs_f64() * 1000.0,
+                response.len(),
+            );
+
             RequestResult::Complete(0)
         }
         Err(e) => {

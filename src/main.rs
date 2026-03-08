@@ -8,8 +8,6 @@ mod reset;
 
 use anyhow::Result;
 
-// NOT using #[tokio::main] — Tokio runtime must not exist before fork().
-// Each forked worker creates its own runtime.
 fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
@@ -23,13 +21,14 @@ fn main() -> Result<()> {
 
     // Load config (CLI args + optional TOML file)
     let config = config::Config::load()?;
+    let total_workers: usize = config.pools.iter().map(|p| p.pm_max_children).sum();
     tracing::info!(
         "Loaded {} pool(s), {} total workers",
         config.pools.len(),
-        config.pools.iter().map(|p| p.pm_max_children).sum::<usize>()
+        total_workers
     );
 
-    // 1. Bind all pool sockets BEFORE fork (may need root for /var/run/)
+    // Bind all pool sockets
     let mut pool_listeners = Vec::new();
     for pool in &config.pools {
         let _ = std::fs::remove_file(&pool.listen);
@@ -40,15 +39,29 @@ fn main() -> Result<()> {
         pool_listeners.push(listener);
     }
 
-    // 2. Init PHP SAPI with OPcache BEFORE fork — all children inherit this state
+    // Init PHP SAPI + module startup (once, before any threads)
     let php_ini = config.pools.first().and_then(|p| p.php_ini.as_deref());
     let _sapi_ptr = php_sapi::init_sapi(php_ini);
     tracing::info!("PHP SAPI initialized (OPcache loaded if configured)");
 
-    // 3. Fork workers and supervise (blocks until shutdown)
-    pool_manager::run(config, pool_listeners)?;
+    // Create Tokio runtime with N blocking threads for PHP execution
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(total_workers)
+        .enable_all()
+        .build()?;
 
-    // 4. Cleanup (master only, after all children exited)
+    tracing::info!(
+        "Tokio runtime: 2 async threads, {} blocking threads",
+        total_workers
+    );
+
+    // Run accept loop (blocks until shutdown)
+    rt.block_on(async {
+        pool_manager::run_threaded(config, pool_listeners).await
+    })?;
+
+    // Cleanup
     php_sapi::shutdown_sapi();
 
     Ok(())
